@@ -328,9 +328,9 @@ with tab1:
         )
     with col_upload:
         uploaded_file = st.file_uploader(
-            "📁 Optional: Upload file (.txt, .md):",
-            type=["txt", "md"],
-            help="Upload an external text or markdown document to populate the context field.",
+            "📁 Optional: Upload file (.txt, .md, .docx, .pdf):",
+            type=["txt", "md", "docx", "pdf"],
+            help="Upload an external text, markdown, Word document (.docx), or PDF file (up to 1,000 MB) to populate the context field.",
         )
 
     # Auto-clear comparison state when switching presets
@@ -345,9 +345,45 @@ with tab1:
 
     if uploaded_file is not None:
         try:
-            uploaded_content = uploaded_file.read().decode("utf-8")
-            if uploaded_content.strip():
-                default_text = uploaded_content
+            fname = uploaded_file.name.lower()
+            if fname.endswith(".docx"):
+                import docx
+                doc = docx.Document(uploaded_file)
+                extracted_lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+                for table in doc.tables:
+                    for row in table.rows:
+                        row_vals = [c.text.strip() for c in row.cells if c.text.strip()]
+                        if row_vals:
+                            extracted_lines.append(" | ".join(row_vals))
+                extracted_content = "\n\n".join(extracted_lines)
+                if extracted_content.strip():
+                    default_text = extracted_content
+                    st.toast(f"📄 Loaded Word document: {uploaded_file.name}", icon="✅")
+                else:
+                    st.warning("The uploaded Word document contains no readable text.")
+            elif fname.endswith(".pdf"):
+                from pypdf import PdfReader
+                reader = PdfReader(uploaded_file)
+                pages_text = []
+                for idx, page in enumerate(reader.pages):
+                    ptxt = page.extract_text()
+                    if ptxt and ptxt.strip():
+                        pages_text.append(ptxt.strip())
+                extracted_content = "\n\n".join(pages_text)
+                if extracted_content.strip():
+                    default_text = extracted_content
+                    st.toast(f"📕 Loaded PDF ({len(reader.pages)} pages): {uploaded_file.name}", icon="✅")
+                else:
+                    st.warning("Could not extract text from this PDF (it may contain scanned images rather than selectable text).")
+            else:
+                raw_bytes = uploaded_file.read()
+                try:
+                    uploaded_content = raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    uploaded_content = raw_bytes.decode("latin-1", errors="replace")
+                if uploaded_content.strip():
+                    default_text = uploaded_content
+                    st.toast(f"📝 Loaded text file: {uploaded_file.name}", icon="✅")
         except Exception as e:
             st.error(f"Error reading uploaded file: {e}")
 

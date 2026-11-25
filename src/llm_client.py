@@ -28,26 +28,33 @@ class MockLLM:
         target_chunk_idx = -1
         needle_pos = -1
 
-        # 1. Check for synthetic needles (passcode, secret, code, key, pin, etc.)
-        needle_match = re.search(
-            r"(?:code|passcode|secret|pin|number|key)\s*(?:is|:|=)\s*([A-Za-z0-9\-_]+)",
-            prompt,
-            re.IGNORECASE,
-        )
-
-        # 2. Extract question from prompt
+        # 1. Extract question from prompt FIRST
         q_match = re.search(
             r"(?:QUESTION / INQUIRY:|Question:|REPEATED QUESTION:)\s*([^\n\r]+)",
             prompt,
             re.IGNORECASE,
         )
         question = q_match.group(1).strip() if q_match else ""
+        q_lower = question.lower()
 
-        # 3. Extract [Document Excerpt X]: blocks
+        # 2. Extract [Document Excerpt X]: blocks
         excerpts = re.findall(
             r"\[Document Excerpt \d+\]:\s*\n?(.*?)(?=(?:---\s*\n\s*\[Document Excerpt|\n\nINSTRUCTION:|\n\nQuestion:|$))",
             prompt,
             re.DOTALL,
+        )
+
+        # Classify user query intent
+        is_formula_query = any(k in q_lower for k in ["formula", "formulae", "equation", "math", "derivation", "algorithm", "slot", "two-pointer", "sandwich", "decay", "calculate", "compute"])
+        is_summary_query = any(k in q_lower for k in ["summar", "brief", "overview", "gist", "key point", "outline", "main point"])
+        asks_for_secret = any(k in q_lower for k in ["passcode", "secret", "password", "pin", "abort code", "security key", "override code", "key", "passphrase"])
+
+        # Sanitize prompt to prevent student ID, Roll No, or Register No from being mistaken for a secret needle
+        sanitized_prompt = re.sub(
+            r"(?:register|roll|registration|student|candidate|phone|mobile|contact|page|serial)\s*(?:number|no|id)?\s*[:=]\s*[A-Za-z0-9\-_]+",
+            "",
+            prompt,
+            flags=re.IGNORECASE,
         )
 
         KNOWN_TARGETS = [
@@ -58,36 +65,67 @@ class MockLLM:
         ]
 
         best_excerpt = ""
-        alpha_match = re.search(r"\b(ALPHA_[A-Za-z0-9\-_]+)\b", prompt, re.IGNORECASE)
-        if alpha_match:
-            target_value = alpha_match.group(1)
-            for idx, exc in enumerate(excerpts):
-                if target_value.lower() in exc.lower():
-                    target_chunk_idx = idx + 1
-                    best_excerpt = exc.strip()
-                    needle_pos = prompt.find(target_value)
-                    break
-        elif needle_match:
-            target_value = needle_match.group(1)
-            needle_pos = needle_match.start()
-            for idx, exc in enumerate(excerpts):
-                if target_value in exc:
-                    target_chunk_idx = idx + 1
-                    best_excerpt = exc.strip()
-                    break
-        else:
-            for kt in KNOWN_TARGETS:
-                if kt in prompt_lower:
-                    for idx, exc in enumerate(excerpts):
-                        if kt in exc.lower():
-                            target_value = kt
-                            target_chunk_idx = idx + 1
-                            best_excerpt = exc.strip()
-                            needle_pos = prompt_lower.find(kt)
-                            break
-                    if target_chunk_idx > 0:
-                        break
 
+        # Route 1: If user asks for formulas, equations, or mathematical derivations
+        if is_formula_query and excerpts:
+            scorer = BM25Scorer()
+            formula_search_query = f"{question} formula equation slot interleaving two-pointer rope decay attention"
+            ranked_excerpts = scorer.rank_chunks(formula_search_query, excerpts)
+            if ranked_excerpts:
+                best_excerpt = ranked_excerpts[0]["content"].strip()
+                target_chunk_idx = ranked_excerpts[0]["original_index"] + 1
+                needle_pos = prompt.find(best_excerpt)
+                target_value = "FORMULA_SUMMARY_SPECIAL"
+
+        # Route 2: If user asks for general summary and not a secret code
+        elif is_summary_query and not asks_for_secret and excerpts:
+            scorer = BM25Scorer()
+            ranked_excerpts = scorer.rank_chunks(question, excerpts)
+            if ranked_excerpts and ranked_excerpts[0]["score"] > 0:
+                best_excerpt = ranked_excerpts[0]["content"].strip()
+                target_chunk_idx = ranked_excerpts[0]["original_index"] + 1
+                needle_pos = prompt.find(best_excerpt)
+                target_value = "EXECUTIVE_SUMMARY_SPECIAL"
+
+        # Route 3: Check for synthetic preset needles (only if question asks for code or query is empty)
+        if not target_value:
+            alpha_match = re.search(r"\b(ALPHA_[A-Za-z0-9\-_]+)\b", sanitized_prompt, re.IGNORECASE)
+            needle_match = re.search(
+                r"(?:code|passcode|secret|pin|key)\s*(?:is|:|=)\s*([A-Za-z0-9\-_]+)",
+                sanitized_prompt,
+                re.IGNORECASE,
+            ) if asks_for_secret or not question else None
+
+            if alpha_match:
+                target_value = alpha_match.group(1)
+                for idx, exc in enumerate(excerpts):
+                    if target_value.lower() in exc.lower():
+                        target_chunk_idx = idx + 1
+                        best_excerpt = exc.strip()
+                        needle_pos = prompt.find(target_value)
+                        break
+            elif needle_match:
+                target_value = needle_match.group(1)
+                needle_pos = prompt.find(target_value)
+                for idx, exc in enumerate(excerpts):
+                    if target_value in exc:
+                        target_chunk_idx = idx + 1
+                        best_excerpt = exc.strip()
+                        break
+            else:
+                for kt in KNOWN_TARGETS:
+                    if kt in prompt_lower:
+                        for idx, exc in enumerate(excerpts):
+                            if kt in exc.lower():
+                                target_value = kt
+                                target_chunk_idx = idx + 1
+                                best_excerpt = exc.strip()
+                                needle_pos = prompt_lower.find(kt)
+                                break
+                        if target_chunk_idx > 0:
+                            break
+
+        # Route 4: Fallback BM25 relevance ranking
         if not target_value and excerpts and question:
             scorer = BM25Scorer()
             ranked_excerpts = scorer.rank_chunks(question, excerpts)
@@ -97,7 +135,7 @@ class MockLLM:
                 sentences = [
                     s.strip()
                     for s in re.split(r"(?<=[.!?])\s+", best_excerpt)
-                    if len(s.strip()) > 10
+                    if len(s.strip()) > 10 and not any(k in s.lower() for k in ["register number", "roll number", "student_id", "phone"])
                 ]
                 ranked_sentences = (
                     scorer.rank_chunks(question, sentences) if sentences else []
@@ -150,20 +188,57 @@ class MockLLM:
             flags=re.IGNORECASE,
         ).strip()
 
-        is_summary = any(k in question.lower() for k in ["summar", "brief", "overview", "gist", "key point", "explain", "describe"])
-
         # Determine retrieval success
         if random.random() < effective_accuracy:
             q_lower = question.lower()
             t_lower = clean_text.lower()
 
-            if is_summary:
-                sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_text) if len(s.strip()) > 10]
+            # Handle Formula Summaries
+            if target_value == "FORMULA_SUMMARY_SPECIAL" or is_formula_query:
+                formula_lines = []
+                for exc in excerpts:
+                    for line in exc.split("\n"):
+                        l_clean = line.strip()
+                        if any(sym in l_clean for sym in ["Slot(", "=", "∝", "->", "P =", "Attn(", "\\lfloor", "O(", "IDF(", "BM25", "RoPE"]) and len(l_clean) > 8:
+                            if not any(k in l_clean.lower() for k in ["register", "roll", "student_id", "phone", "contact", "date"]):
+                                formula_lines.append(l_clean)
+
+                if formula_lines:
+                    unique_formulas = list(dict.fromkeys(formula_lines))[:5]
+                    f_list = "\n".join([f"• `{f}`" for f in unique_formulas])
+                    ans_body = (
+                        f"**Mathematical Formulations & Algorithmic Summary:**\n\n"
+                        f"{f_list}\n\n"
+                        f"**Core Algorithmic Principles:**\n"
+                        f"- **Two-Pointer U-Curve Dispatching:** Maps chunks with `Slot(r_i) = n - 1 - (i/2)` for recency and `Slot(r_i) = (i-1)/2` for primacy.\n"
+                        f"- **Dual Query Anchoring:** Synthesizes `Prompt = [System] + [Query: q] + [Passages] + [Query: q] + [Answer Trigger]` to eliminate RoPE attention decay."
+                    )
+                else:
+                    ans_body = (
+                        f"**Mathematical Formulations & Algorithmic Summary:**\n\n"
+                        f"• **Two-Pointer U-Curve Slot Assignment:**\n"
+                        f"  - *Recency Boundary (Even Rank $i$):* $\\text{{Slot}}(r_i) = n - 1 - \\lfloor i / 2 \\rfloor$\n"
+                        f"  - *Primacy Boundary (Odd Rank $i$):* $\\text{{Slot}}(r_i) = \\lfloor (i - 1) / 2 \\rfloor$\n"
+                        f"  - *Algorithmic Complexity:* $\\mathcal{{O}}(n \\log n)$ sorting, $\\mathcal{{O}}(n)$ interleaving.\n\n"
+                        f"• **Dual Query Anchoring (\"Sandwich Prompting\"):**\n"
+                        f"  - $\\mathcal{{P}} = [\\text{{System Directive}}] + [\\text{{Query: }} q] + [\\text{{Passages}}] + [\\text{{Query: }} q] + [\\text{{Answer Trigger}}]$\n\n"
+                        f"• **RoPE Distance Attention Decay:**\n"
+                        f"  - Attention dot product attenuates with relative token distance $|m - n|$:\n"
+                        f"    $$\\text{{Attn}}(m, n) \\propto \\exp(-\\lambda |m - n|)$$"
+                    )
+
+            # Handle Executive Summaries
+            elif target_value == "EXECUTIVE_SUMMARY_SPECIAL" or is_summary_query:
+                sentences = [
+                    s.strip() for s in re.split(r"(?<=[.!?])\s+", best_excerpt)
+                    if len(s.strip()) > 15 and not any(k in s.lower() for k in ["register number", "roll number", "student_id", "phone", "contact"])
+                ]
                 if len(sentences) > 1:
-                    bullet_list = "\n".join([f"- {s}" for s in sentences[:3]])
+                    bullet_list = "\n".join([f"- {s}" for s in sentences[:4]])
                     ans_body = f"**Executive Summary:**\n{bullet_list}"
                 else:
-                    ans_body = f"**Executive Summary:** {clean_text}"
+                    ans_body = f"**Executive Summary:** {best_excerpt}"
+
             elif "scram-lunar-1102-sec" in t_lower:
                 ans_body = "**Emergency Abort Delta-V Key:** SCRAM-LUNAR-1102-SEC"
             elif "tazobactam-piperacillin" in t_lower:
@@ -172,7 +247,7 @@ class MockLLM:
                 ans_body = "**Emergency Cryogenic Quench Sequence:** CRYOLOCK-QUENCH-8831-OMEGA"
             elif "6,820,000" in clean_text:
                 ans_body = "**Unauthorized Wire Transfer Amount:** $6,820,000 USD (Escrow Account: AEGIS-TRUST-BERMUDA-99)"
-            elif "35%" in clean_text and "rebate" in t_lower or "uptime" in t_lower:
+            elif "35%" in clean_text and ("rebate" in t_lower or "uptime" in t_lower):
                 ans_body = "**Guaranteed Liquidated Damages Rebate:** 35% service fee credit"
             elif "99.9842" in clean_text or "quench-flux" in t_lower:
                 ans_body = (
